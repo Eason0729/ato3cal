@@ -2,40 +2,51 @@ use std::error::Error;
 use std::fs::File;
 use std::io::BufWriter;
 use serde::{Serialize, Deserialize};
+use nalgebra::{DMatrix, DVector};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct LinearModel {
-    pub slope: f64,
-    pub intercept: f64,
+pub struct PolyModel {
+    pub weights: Vec<f64>,
 }
 
-impl LinearModel {
-    pub fn predict(&self, x: f64) -> f64 {
-        self.slope * x + self.intercept
+impl PolyModel {
+    // Features: [1.0, Seats, Ratio, Ratio^2, IsDirect]
+    pub fn predict(&self, seats: f64, ratio: f64, is_direct: bool) -> f64 {
+        let direct_val = if is_direct { 1.0 } else { 0.0 };
+        let features = vec![1.0, seats, ratio, ratio * ratio, direct_val];
+        
+        features.iter().zip(&self.weights).map(|(f, w)| f * w).sum()
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct PredictionSystem {
-    pub stopover_same: LinearModel,
-    pub direct_same: LinearModel,
-    pub stopover_twice: LinearModel,
-    pub direct_twice: LinearModel,
-    pub stopover_thrice: LinearModel,
-    pub direct_thrice: LinearModel,
-}
+fn train_model(samples: &[(f64, f64, bool, f64)]) -> PolyModel {
+    // samples: (seats, ratio, is_direct, target_sum)
+    let n = samples.len();
+    let m = 5; // Bias, Seats, Ratio, Ratio^2, IsDirect
 
-fn train_linear_regression(x: &[f64], y: &[f64]) -> LinearModel {
-    let n = x.len() as f64;
-    let sum_x: f64 = x.iter().sum();
-    let sum_y: f64 = y.iter().sum();
-    let sum_xy: f64 = x.iter().zip(y.iter()).map(|(xi, yi)| xi * yi).sum();
-    let sum_xx: f64 = x.iter().map(|xi| xi * xi).sum();
+    let mut x_vals = Vec::with_capacity(n * m);
+    let mut y_vals = Vec::with_capacity(n);
 
-    let slope = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x);
-    let intercept = (sum_y - slope * sum_x) / n;
+    for (seats, ratio, is_direct, target) in samples {
+        x_vals.push(1.0);
+        x_vals.push(*seats);
+        x_vals.push(*ratio);
+        x_vals.push(ratio * ratio);
+        x_vals.push(if *is_direct { 1.0 } else { 0.0 });
+        
+        y_vals.push(*target);
+    }
 
-    LinearModel { slope, intercept }
+    let x = DMatrix::from_row_slice(n, m, &x_vals);
+    let y = DVector::from_column_slice(&y_vals);
+
+    // Solve (X^T * X)^-1 * X^T * Y
+    // Using SVD decomposition for stability: OLS
+    let ols = x.svd(true, true).solve(&y, 1e-10).expect("Linear regression failed");
+    
+    let weights: Vec<f64> = ols.iter().cloned().collect();
+
+    PolyModel { weights }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -45,46 +56,39 @@ fn main() -> Result<(), Box<dyn Error>> {
         .has_headers(true)
         .from_reader(file);
 
-    let mut seats = Vec::new();
-    let mut y1 = Vec::new(); // StopoverSame
-    let mut y2 = Vec::new(); // DirectSame
-    let mut y3 = Vec::new(); // StopoverTwice
-    let mut y4 = Vec::new(); // DirectTwice
-    let mut y5 = Vec::new(); // StopoverThrice
-    let mut y6 = Vec::new(); // DirectThrice
+    let mut samples = Vec::new();
 
     for result in rdr.records() {
         let record = result?;
-        // Index 1 is Seats.
-        // Indices 2-7 are the targets.
-        // Note: record indexing depends on how csv parses the empty first column.
-        // If header has one less column or empty string, let's check.
-        // We will assume standard CSV behavior.
+        let seats: f64 = record[1].parse()?;
         
-        let s: f64 = record[1].parse()?;
-        seats.push(s);
-        y1.push(record[2].parse()?);
-        y2.push(record[3].parse()?);
-        y3.push(record[4].parse()?);
-        y4.push(record[5].parse()?);
-        y5.push(record[6].parse()?);
-        y6.push(record[7].parse()?);
+        // CSV Cols: 
+        // 2: Stopover 1.0
+        // 3: Direct 1.0
+        // 4: Stopover 2.0
+        // 5: Direct 2.0
+        // 6: Stopover 3.0
+        // 7: Direct 3.0
+
+        // Ratio 1.0
+        samples.push((seats, 1.0, false, record[2].parse::<f64>()?));
+        samples.push((seats, 1.0, true, record[3].parse::<f64>()?));
+
+        // Ratio 2.0
+        samples.push((seats, 2.0, false, record[4].parse::<f64>()?));
+        samples.push((seats, 2.0, true, record[5].parse::<f64>()?));
+
+        // Ratio 3.0
+        samples.push((seats, 3.0, false, record[6].parse::<f64>()?));
+        samples.push((seats, 3.0, true, record[7].parse::<f64>()?));
     }
 
-    let sys = PredictionSystem {
-        stopover_same: train_linear_regression(&seats, &y1),
-        direct_same: train_linear_regression(&seats, &y2),
-        stopover_twice: train_linear_regression(&seats, &y3),
-        direct_twice: train_linear_regression(&seats, &y4),
-        stopover_thrice: train_linear_regression(&seats, &y5),
-        direct_thrice: train_linear_regression(&seats, &y6),
-    };
-
-    println!("Trained Models: {:?}", sys);
+    let model = train_model(&samples);
+    println!("Trained Weights: {:?}", model.weights);
 
     let out_file = File::create("../model.bin")?;
     let mut writer = BufWriter::new(out_file);
-    bincode::serialize_into(&mut writer, &sys)?;
+    bincode::serialize_into(&mut writer, &model)?;
     println!("Model saved to ../model.bin");
 
     Ok(())
@@ -95,21 +99,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_linear_regression_perfect() {
-        let x = vec![1.0, 2.0, 3.0];
-        let y = vec![2.0, 4.0, 6.0]; // y = 2x
-        let model = train_linear_regression(&x, &y);
-        assert!((model.slope - 2.0).abs() < 1e-6);
-        assert!((model.intercept - 0.0).abs() < 1e-6);
-        assert!((model.predict(4.0) - 8.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_linear_regression_offset() {
-        let x = vec![1.0, 2.0, 3.0];
-        let y = vec![3.0, 5.0, 7.0]; // y = 2x + 1
-        let model = train_linear_regression(&x, &y);
-        assert!((model.slope - 2.0).abs() < 1e-6);
-        assert!((model.intercept - 1.0).abs() < 1e-6);
+    fn test_model_monotonicity_ratio() {
+        // Create a dummy model (or train on small data)
+        // Let's train on a tiny subset that mimics the real rule: 
+        // Base=1000, +50 for Ratio 2, +150 for Ratio 3.
+        let samples = vec![
+            (100.0, 1.0, false, 1000.0),
+            (100.0, 2.0, false, 1050.0),
+            (100.0, 3.0, false, 1150.0),
+        ];
+        
+        let model = train_model(&samples);
+        
+        let p1 = model.predict(100.0, 1.0, false);
+        let p2 = model.predict(100.0, 2.0, false);
+        let p3 = model.predict(100.0, 3.0, false);
+        
+        // Verify increasing ratio increases cost
+        assert!(p2 > p1);
+        assert!(p3 > p2);
+        
+        // Verify non-linear jump (1.0->2.0 is +50, 2.0->3.0 is +100)
+        let diff1 = p2 - p1;
+        let diff2 = p3 - p2;
+        assert!((diff2 - diff1).abs() > 10.0); // Expect acceleration
     }
 }
